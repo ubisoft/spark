@@ -31,6 +31,7 @@ import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.types._
+import org.apache.spark.util.Utils
 
 class InMemorySessionCatalogSuite extends SessionCatalogSuite {
   protected val utils = new CatalogTestUtils {
@@ -635,11 +636,18 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
   }
 
   private def getViewPlan(metadata: CatalogTable): LogicalPlan = {
-    import org.apache.spark.sql.catalyst.dsl.expressions._
-    val projectList = metadata.schema.map { field =>
-      UpCast(field.name.attr, field.dataType).as(field.name)
-    }
+    val projectList = metadata.schema.map { field => innerStruct(Seq(), field)}
     Project(projectList, CatalystSqlParser.parsePlan(metadata.viewText.get))
+  }
+
+  private def innerStruct(parent: Seq[String], field : StructField) : NamedExpression = {
+    import org.apache.spark.sql.catalyst.dsl.expressions._
+    field.dataType match {
+      case structType : StructType => CreateStruct.create(structType.map {
+        subField => innerStruct(parent :+ field.name, subField)
+      }).as(field.name)
+      case _ => UpCast((parent :+ field.name).mkString(".").attr, field.dataType).as(field.name)
+    }
   }
 
   test("look up view relation") {
@@ -678,6 +686,44 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         SubqueryAlias(Seq(CatalogManager.SESSION_CATALOG_NAME, "db3", "view2"), view))
     }
   }
+
+
+    test("SPARK-34528: named explicitly field in struct of a view") {
+      withEmptyCatalog { catalog =>
+        val databaseName = "default"
+        val tableName = "complex_table"
+        val viewName = "view_table"
+        val subSchema = new StructType()
+          .add("col1", "int")
+          .add("col2", "string")
+          .add("a", "int")
+          .add("b", "string")
+        val schema = new StructType()
+          .add("id", "int")
+          .add("complex", subSchema)
+        val complexTable = CatalogTable(
+          identifier = TableIdentifier(tableName, Some(databaseName)),
+          tableType = CatalogTableType.EXTERNAL,
+          storage = storageFormat.copy(locationUri = Some(Utils.createTempDir().toURI)),
+          schema = schema,
+          provider = Some(defaultProvider))
+        catalog.createTable(complexTable, ignoreIfExists = false)
+        val view = CatalogTable(
+          identifier = TableIdentifier(viewName, Some(databaseName)),
+          tableType = CatalogTableType.VIEW,
+          storage = CatalogStorageFormat.empty,
+          schema = schema,
+          viewText = Some(s"SELECT * FROM $tableName")
+        )
+        catalog.createTable(view, ignoreIfExists = false)
+        val viewMetadata = catalog.externalCatalog.getTable(databaseName, viewName)
+        val viewPlan = View(desc = viewMetadata, isTempView = false,
+          child = getViewPlan(viewMetadata))
+
+        comparePlans(catalog.lookupRelation(TableIdentifier(viewName, Some(databaseName))),
+          SubqueryAlias(Seq(CatalogManager.SESSION_CATALOG_NAME, databaseName, viewName), viewPlan))
+      }
+    }
 
   test("table exists") {
     withBasicCatalog { catalog =>

@@ -35,7 +35,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst._
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FunctionBuilder
-import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, ExpressionInfo, ImplicitCastInputTypes, UpCast}
+import org.apache.spark.sql.catalyst.expressions.{Alias, CreateStruct, Expression, ExpressionInfo, ImplicitCastInputTypes, NamedExpression, UpCast}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
 import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, StringUtils}
@@ -43,7 +43,7 @@ import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.GLOBAL_TEMP_DATABASE
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types.{StructField, StructType}
 import org.apache.spark.sql.util.{CaseInsensitiveStringMap, PartitioningUtils}
 import org.apache.spark.util.Utils
 
@@ -875,10 +875,22 @@ class SessionCatalog(
     // safe) and Alias (to respect user-specified view column names) according to the view schema
     // in the catalog.
     val projectList = viewColumnNames.zip(metadata.schema).map { case (name, field) =>
-      Alias(UpCast(UnresolvedAttribute.quoted(name), field.dataType), field.name)(
-        explicitMetadata = Some(field.metadata))
+      createNamedExpr(Seq(), name, field)
     }
     View(desc = metadata, isTempView = isTempView, child = Project(projectList, parsedPlan))
+  }
+
+  private def createNamedExpr(
+      parent : Seq[String],
+      name : String,
+      field : StructField) : NamedExpression = {
+    field.dataType match {
+      case structType: StructType => Alias(CreateStruct.create(structType.map {
+        subField => createNamedExpr(parent :+ name, subField.name, subField)
+      }), field.name)(explicitMetadata = Some(field.metadata))
+      case _ => Alias(UpCast(UnresolvedAttribute(parent :+ name), field.dataType),
+        field.name)(explicitMetadata = Some(field.metadata))
+    }
   }
 
   def lookupTempView(table: String): Option[SubqueryAlias] = {
