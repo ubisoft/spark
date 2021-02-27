@@ -35,7 +35,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst._
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FunctionBuilder
-import org.apache.spark.sql.catalyst.expressions.{Alias, CreateArray, CreateStruct, Expression, ExpressionInfo, ImplicitCastInputTypes, LambdaFunction, NamedExpression, TransformValues, UnresolvedNamedLambdaVariable, UpCast}
+import org.apache.spark.sql.catalyst.expressions.{Alias, ArrayTransform, CreateStruct, Expression, ExpressionInfo, ImplicitCastInputTypes, LambdaFunction, NamedExpression, TransformKeys, TransformValues, Unevaluable, UnresolvedNamedLambdaVariable, UpCast}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
 import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, StringUtils}
@@ -875,7 +875,8 @@ class SessionCatalog(
     // safe) and Alias (to respect user-specified view column names) according to the view schema
     // in the catalog.
     val projectList = viewColumnNames.zip(metadata.schema).map { case (name, field) =>
-      createNamedExpr(Seq(), name, field.dataType, Some(field.metadata))
+      createNamedExpr(Seq(), name, field.name, field.dataType,
+        Some(field.metadata), inLambda = false)
     }
     View(desc = metadata, isTempView = isTempView, child = Project(projectList, parsedPlan))
   }
@@ -883,47 +884,85 @@ class SessionCatalog(
   private def createNamedExpr(
                           parent : Seq[String],
                           name : String,
+                          fieldName : String,
                           dataType : DataType,
-                          metadata : Option[Metadata]) : NamedExpression = {
-    Alias(createExpr(parent, name, dataType, metadata), name)(explicitMetadata = metadata)
+                          metadata : Option[Metadata],
+                          inLambda : Boolean) : NamedExpression = {
+    Alias(createExpr(parent, name, dataType, metadata, inLambda),
+      fieldName)(explicitMetadata = metadata)
   }
 
   private def createExpr(
       parent : Seq[String],
       name : String,
       dataType : DataType,
-      metadata : Option[Metadata]) : Expression = {
+      metadata : Option[Metadata],
+      inLambda : Boolean) : Expression = {
+    val key = UnresolvedNamedLambdaVariable(Seq("key"))
+    val value = UnresolvedNamedLambdaVariable(Seq("value"))
     dataType match {
       case structType: StructType => CreateStruct.create(structType.map {
-        subField => createNamedExpr(parent :+ name, subField.name,
-          subField.dataType, Some(subField.metadata))
+        subField => createNamedExpr(parent :+ name, subField.name, subField.name,
+          subField.dataType, Some(subField.metadata), inLambda)
       })
       case arrayType : ArrayType => if (needToBeExplode(arrayType)) {
-          CreateArray.apply(Seq(createNamedExpr(parent, name, arrayType.elementType, None)))
+          ArrayTransform(
+            UnresolvedAttribute(parent :+ name),
+            LambdaFunction(
+              createExpr(Seq(), "value", arrayType.elementType, metadata, inLambda = true),
+              Seq(value)
+            )
+          )
         } else {
-          UpCast(UnresolvedAttribute(parent :+ name), dataType)
+          upCast(parent :+ name, inLambda, dataType)
         }
-      case mapType : MapType => if (needToBeExplode(mapType)) {
-        val key = UnresolvedNamedLambdaVariable(Seq("key"))
-        val value = UnresolvedNamedLambdaVariable(Seq("value"))
+      case mapType : MapType => if (needToBeExplode(mapType.keyType)
+        && needToBeExplode(mapType.valueType)) {
+        TransformValues(
+          TransformKeys(
+            UnresolvedAttribute(parent :+ name),
+            LambdaFunction(createExpr(Seq(), "key", mapType.keyType, metadata, inLambda = true),
+              Seq(key, value))
+          ),
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, metadata, inLambda = true),
+            Seq(key, value))
+        )
+      } else if (needToBeExplode(mapType.keyType) ) {
+        TransformKeys(
+          UnresolvedAttribute(parent :+ name),
+          LambdaFunction(createExpr(Seq(), "key", mapType.keyType, metadata, inLambda = true),
+            Seq(key, value))
+        )
+      } else if (needToBeExplode(mapType.valueType) ) {
         TransformValues(
           UnresolvedAttribute(parent :+ name),
-          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, metadata), Seq(key, value))
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, metadata, inLambda = true),
+            Seq(key, value))
         )
       } else {
-        UpCast(UnresolvedAttribute(parent :+ name), dataType)
+        upCast(parent :+ name, inLambda, dataType)
       }
-      case _ => UpCast(UnresolvedAttribute(parent :+ name), dataType)
+      case _ => upCast(parent :+ name, inLambda, dataType)
     }
   }
 
-  @scala.annotation.tailrec
+  private def upCast(
+        nameParts: Seq[String],
+        inLambda : Boolean,
+        dataType: DataType) : Unevaluable = {
+    UpCast(if (inLambda) {
+      UnresolvedNamedLambdaVariable(nameParts)
+    } else {
+      UnresolvedAttribute(nameParts)
+    }, dataType)
+  }
+
   private def needToBeExplode(dataType : DataType) : Boolean = {
     dataType match {
       case _ : StructType => true
       case arrayType: ArrayType => needToBeExplode(arrayType.elementType)
-        // Do not need to check the key because key can not be a complex type
-      case mapType: MapType => needToBeExplode(mapType.valueType)
+      case mapType: MapType => needToBeExplode(mapType.keyType) ||
+        needToBeExplode(mapType.valueType)
       case _ => false
     }
   }

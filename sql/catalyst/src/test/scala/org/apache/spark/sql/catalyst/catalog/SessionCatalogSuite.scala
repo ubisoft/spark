@@ -637,7 +637,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
 
   private def getViewPlan(metadata: CatalogTable): LogicalPlan = {
     val projectList = metadata.schema.map { field =>
-      createNamedExpr(Seq(), field.name, field.dataType)
+      createNamedExpr(Seq(), field.name, field.dataType, inLambda = false)
     }
     Project(projectList, CatalystSqlParser.parsePlan(metadata.viewText.get))
   }
@@ -645,52 +645,87 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
   private def createNamedExpr(
     parent: Seq[String],
     fieldName : String,
-    fieldDateType : DataType) : NamedExpression = {
+    fieldDateType : DataType,
+    inLambda : Boolean) : NamedExpression = {
     import org.apache.spark.sql.catalyst.dsl.expressions._
-    createExpr(parent, fieldName, fieldDateType).as(fieldName)
+    createExpr(parent, fieldName, fieldDateType, inLambda).as(fieldName)
   }
 
   private def createExpr(
        parent: Seq[String],
        fieldName : String,
-       fieldDateType : DataType) : Expression = {
+       fieldDateType : DataType,
+       inLambda : Boolean) : Expression = {
+    import org.apache.spark.sql.catalyst.dsl.expressions._
+    val key = UnresolvedNamedLambdaVariable(Seq("key"))
+    val value = UnresolvedNamedLambdaVariable(Seq("value"))
     fieldDateType match {
       case structType : StructType => CreateStruct.create(structType.map {
-        subField => createNamedExpr(parent :+ fieldName, subField.name, subField.dataType)
+        subField => createNamedExpr(parent :+ fieldName, subField.name, subField.dataType, inLambda)
       })
       case arrayType : ArrayType => if (needToBeExplode(arrayType)) {
-        CreateArray.apply(
-          Seq(createNamedExpr(parent, fieldName, arrayType.elementType))
+        ArrayTransform(
+          (parent :+ fieldName).mkString(".").attr,
+          LambdaFunction(createExpr(Seq(), "value", arrayType.elementType, inLambda = true),
+            Seq(value)
+          )
         )
       } else {
-        upCast(parent, fieldName, fieldDateType)
+        upCast(parent :+ fieldName, fieldDateType, inLambda)
       }
-      case mapType : MapType => if (needToBeExplode(mapType)) {
-        import org.apache.spark.sql.catalyst.dsl.expressions._
-        val key = UnresolvedNamedLambdaVariable(Seq("key"))
-        val value = UnresolvedNamedLambdaVariable(Seq("value"))
+      case mapType : MapType => if (needToBeExplode(mapType.keyType)
+        && needToBeExplode(mapType.valueType)) {
+        TransformValues(
+          TransformKeys(
+            (parent :+ fieldName).mkString(".").attr,
+            LambdaFunction(createExpr(Seq(), "key", mapType.keyType, inLambda = true),
+              Seq(key, value)
+            )
+          ),
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, inLambda = true),
+            Seq(key, value)
+          )
+        )
+      } else if (needToBeExplode(mapType.keyType)) {
+        TransformKeys(
+          (parent :+ fieldName).mkString(".").attr,
+          LambdaFunction(createExpr(Seq(), "key", mapType.keyType, inLambda = true),
+            Seq(key, value)
+          )
+        )
+      } else if (needToBeExplode(mapType.valueType)) {
         TransformValues(
           (parent :+ fieldName).mkString(".").attr,
-          LambdaFunction(createExpr(Seq(), "value", mapType.valueType), Seq(key, value))
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, inLambda = true),
+            Seq(key, value)
+          )
         )
       } else {
-        upCast(parent, fieldName, fieldDateType)
+        upCast(parent :+ fieldName, fieldDateType, inLambda)
       }
-      case _ => upCast(parent, fieldName, fieldDateType)
+      case _ => upCast(parent :+ fieldName, fieldDateType, inLambda)
     }
   }
 
-  private def upCast(parent: Seq[String], fieldName: String, fieldDateType: DataType) = {
+  private def upCast(
+        nameParts: Seq[String],
+        fieldDateType: DataType,
+        inLambda : Boolean) = {
     import org.apache.spark.sql.catalyst.dsl.expressions._
-    UpCast((parent :+ fieldName).mkString(".").attr, fieldDateType)
+    UpCast(
+      if (inLambda) {
+        UnresolvedNamedLambdaVariable(nameParts)
+      } else {
+      nameParts.mkString(".").attr
+      }, fieldDateType)
   }
 
-  @scala.annotation.tailrec
   private def needToBeExplode(dataType : DataType) : Boolean = {
     dataType match {
       case _ : StructType => true
       case arrayType: ArrayType => needToBeExplode(arrayType.elementType)
-      case mapType: MapType => needToBeExplode(mapType.valueType)
+      case mapType: MapType => needToBeExplode(mapType.keyType) ||
+        needToBeExplode(mapType.valueType)
       case _ => false
     }
   }
@@ -756,7 +791,7 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
           )
           .add("subMap", new MapType(StringType, new ArrayType(IntegerType, containsNull = true)
             , valueContainsNull = true))
-          .add("subComplexMap", new MapType(StringType, subSubSchema, valueContainsNull = true))
+          .add("subComplexMap", new MapType(subSubSchema, StringType, valueContainsNull = true))
         val schema = new StructType()
           .add("id", "int")
           .add("complex", subSchema)
