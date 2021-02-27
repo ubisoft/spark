@@ -636,17 +636,62 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
   }
 
   private def getViewPlan(metadata: CatalogTable): LogicalPlan = {
-    val projectList = metadata.schema.map { field => innerStruct(Seq(), field)}
+    val projectList = metadata.schema.map { field =>
+      createNamedExpr(Seq(), field.name, field.dataType)
+    }
     Project(projectList, CatalystSqlParser.parsePlan(metadata.viewText.get))
   }
 
-  private def innerStruct(parent: Seq[String], field : StructField) : NamedExpression = {
+  private def createNamedExpr(
+    parent: Seq[String],
+    fieldName : String,
+    fieldDateType : DataType) : NamedExpression = {
     import org.apache.spark.sql.catalyst.dsl.expressions._
-    field.dataType match {
+    createExpr(parent, fieldName, fieldDateType).as(fieldName)
+  }
+
+  private def createExpr(
+       parent: Seq[String],
+       fieldName : String,
+       fieldDateType : DataType) : Expression = {
+    fieldDateType match {
       case structType : StructType => CreateStruct.create(structType.map {
-        subField => innerStruct(parent :+ field.name, subField)
-      }).as(field.name)
-      case _ => UpCast((parent :+ field.name).mkString(".").attr, field.dataType).as(field.name)
+        subField => createNamedExpr(parent :+ fieldName, subField.name, subField.dataType)
+      })
+      case arrayType : ArrayType => if (needToBeExplode(arrayType)) {
+        CreateArray.apply(
+          Seq(createNamedExpr(parent, fieldName, arrayType.elementType))
+        )
+      } else {
+        upCast(parent, fieldName, fieldDateType)
+      }
+      case mapType : MapType => if (needToBeExplode(mapType)) {
+        import org.apache.spark.sql.catalyst.dsl.expressions._
+        val key = UnresolvedNamedLambdaVariable(Seq("key"))
+        val value = UnresolvedNamedLambdaVariable(Seq("value"))
+        TransformValues(
+          (parent :+ fieldName).mkString(".").attr,
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType), Seq(key, value))
+        )
+      } else {
+        upCast(parent, fieldName, fieldDateType)
+      }
+      case _ => upCast(parent, fieldName, fieldDateType)
+    }
+  }
+
+  private def upCast(parent: Seq[String], fieldName: String, fieldDateType: DataType) = {
+    import org.apache.spark.sql.catalyst.dsl.expressions._
+    UpCast((parent :+ fieldName).mkString(".").attr, fieldDateType)
+  }
+
+  @scala.annotation.tailrec
+  private def needToBeExplode(dataType : DataType) : Boolean = {
+    dataType match {
+      case _ : StructType => true
+      case arrayType: ArrayType => needToBeExplode(arrayType.elementType)
+      case mapType: MapType => needToBeExplode(mapType.valueType)
+      case _ => false
     }
   }
 
@@ -693,14 +738,33 @@ abstract class SessionCatalogSuite extends AnalysisTest with Eventually {
         val databaseName = "default"
         val tableName = "complex_table"
         val viewName = "view_table"
+        val subSubSchema = new StructType()
+          .add("c", "long")
+          .add("d", "date")
         val subSchema = new StructType()
           .add("col1", "int")
           .add("col2", "string")
           .add("a", "int")
           .add("b", "string")
+          .add("subComplex", subSubSchema)
+          .add("subMatrix", new ArrayType(
+            new ArrayType(new MapType(StringType, IntegerType, valueContainsNull = true),
+              containsNull = true), containsNull = true)
+          )
+          .add("subComplexMatrix", new ArrayType(
+            new ArrayType(subSubSchema, containsNull = true), containsNull = true)
+          )
+          .add("subMap", new MapType(StringType, new ArrayType(IntegerType, containsNull = true)
+            , valueContainsNull = true))
+          .add("subComplexMap", new MapType(StringType, subSubSchema, valueContainsNull = true))
         val schema = new StructType()
           .add("id", "int")
           .add("complex", subSchema)
+          .add("array", new ArrayType(IntegerType, containsNull = true))
+          .add("complexArray", new ArrayType(subSchema, containsNull = true))
+          .add("map", new MapType(StringType, IntegerType, valueContainsNull = true))
+          .add("complexMap", new MapType(StringType, subSchema, valueContainsNull = true))
+
         val complexTable = CatalogTable(
           identifier = TableIdentifier(tableName, Some(databaseName)),
           tableType = CatalogTableType.EXTERNAL,

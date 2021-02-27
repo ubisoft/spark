@@ -35,7 +35,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst._
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry.FunctionBuilder
-import org.apache.spark.sql.catalyst.expressions.{Alias, CreateStruct, Expression, ExpressionInfo, ImplicitCastInputTypes, NamedExpression, UpCast}
+import org.apache.spark.sql.catalyst.expressions.{Alias, CreateArray, CreateStruct, Expression, ExpressionInfo, ImplicitCastInputTypes, LambdaFunction, NamedExpression, TransformValues, UnresolvedNamedLambdaVariable, UpCast}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, SubqueryAlias, View}
 import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, StringUtils}
@@ -43,7 +43,7 @@ import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.GLOBAL_TEMP_DATABASE
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, Metadata, StructType}
 import org.apache.spark.sql.util.{CaseInsensitiveStringMap, PartitioningUtils}
 import org.apache.spark.util.Utils
 
@@ -875,21 +875,56 @@ class SessionCatalog(
     // safe) and Alias (to respect user-specified view column names) according to the view schema
     // in the catalog.
     val projectList = viewColumnNames.zip(metadata.schema).map { case (name, field) =>
-      createNamedExpr(Seq(), name, field)
+      createNamedExpr(Seq(), name, field.dataType, Some(field.metadata))
     }
     View(desc = metadata, isTempView = isTempView, child = Project(projectList, parsedPlan))
   }
 
   private def createNamedExpr(
+                          parent : Seq[String],
+                          name : String,
+                          dataType : DataType,
+                          metadata : Option[Metadata]) : NamedExpression = {
+    Alias(createExpr(parent, name, dataType, metadata), name)(explicitMetadata = metadata)
+  }
+
+  private def createExpr(
       parent : Seq[String],
       name : String,
-      field : StructField) : NamedExpression = {
-    field.dataType match {
-      case structType: StructType => Alias(CreateStruct.create(structType.map {
-        subField => createNamedExpr(parent :+ name, subField.name, subField)
-      }), field.name)(explicitMetadata = Some(field.metadata))
-      case _ => Alias(UpCast(UnresolvedAttribute(parent :+ name), field.dataType),
-        field.name)(explicitMetadata = Some(field.metadata))
+      dataType : DataType,
+      metadata : Option[Metadata]) : Expression = {
+    dataType match {
+      case structType: StructType => CreateStruct.create(structType.map {
+        subField => createNamedExpr(parent :+ name, subField.name,
+          subField.dataType, Some(subField.metadata))
+      })
+      case arrayType : ArrayType => if (needToBeExplode(arrayType)) {
+          CreateArray.apply(Seq(createNamedExpr(parent, name, arrayType.elementType, None)))
+        } else {
+          UpCast(UnresolvedAttribute(parent :+ name), dataType)
+        }
+      case mapType : MapType => if (needToBeExplode(mapType)) {
+        val key = UnresolvedNamedLambdaVariable(Seq("key"))
+        val value = UnresolvedNamedLambdaVariable(Seq("value"))
+        TransformValues(
+          UnresolvedAttribute(parent :+ name),
+          LambdaFunction(createExpr(Seq(), "value", mapType.valueType, metadata), Seq(key, value))
+        )
+      } else {
+        UpCast(UnresolvedAttribute(parent :+ name), dataType)
+      }
+      case _ => UpCast(UnresolvedAttribute(parent :+ name), dataType)
+    }
+  }
+
+  @scala.annotation.tailrec
+  private def needToBeExplode(dataType : DataType) : Boolean = {
+    dataType match {
+      case _ : StructType => true
+      case arrayType: ArrayType => needToBeExplode(arrayType.elementType)
+        // Do not need to check the key because key can not be a complex type
+      case mapType: MapType => needToBeExplode(mapType.valueType)
+      case _ => false
     }
   }
 
